@@ -478,7 +478,13 @@ async def complete_interview(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Complete an interview session - runs closing node if not already closed."""
+    """Complete an interview session - marks interview as completed instantly.
+
+    Fast path: just flips status to 'completed' in the DB and evicts the
+    orchestrator. Feedback is generated lazily by GET /{id}/feedback when
+    the results page loads — no need to run evaluation + closing nodes here
+    (those were adding 6-12 seconds of unnecessary blocking LLM calls).
+    """
     result = await db.execute(
         select(Interview).where(
             Interview.id == data.interview_id, Interview.user_id == user.id
@@ -501,41 +507,32 @@ async def complete_interview(
             detail=f"Interview is not in progress (current status: {interview.status})",
         )
 
-    orchestrator = get_or_create_orchestrator(interview.id)
+    # Fast path: mark as completed directly — no LangGraph, no LLM calls.
+    # Feedback generation happens lazily when GET /{id}/feedback is called
+    # by the results page, so it doesn't block the user from leaving.
     try:
-        orchestrator.set_db_session(db)
-        state = interview_to_state(interview, user=user)
-
-        # IMPORTANT: execute_step() ignores most of initial_state when a checkpoint
-        # already exists; passing only next_node won't force closing.
-        # Send an explicit stop utterance so routing deterministically goes
-        # stop -> evaluation -> closing.
-        state = await orchestrator.execute_step(
-            state,
-            user_response="Please end the interview now.",
-        )
-
-        state_to_interview(state, interview)
         interview.status = "completed"
         interview.completed_at = datetime.utcnow()
-
         await db.commit()
         await db.refresh(interview)
-        return _interview_to_response(interview, state)
-
+        logger.info(
+            "Interview %s marked as completed (fast path).",
+            interview.id,
+        )
+        return _interview_to_response(interview)
     except Exception as e:
         logger.error(f"Failed to complete interview: {e}", exc_info=True)
-        interview.status = "completed"
-        interview.completed_at = datetime.utcnow()
-        await db.commit()
-        await db.refresh(interview)
-        return _interview_to_response(interview)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to complete interview",
+        )
     finally:
-        # Always evict orchestrator when interview is complete — frees MemorySaver
+        # Evict orchestrator and runtime context to free memory regardless of outcome
         try:
+            orchestrator = get_or_create_orchestrator(interview.id)
             await orchestrator.cleanup_interview(interview.id)
-        except Exception as e:
-            logger.warning(f"Cleanup after complete failed: {e}")
+        except Exception as cleanup_err:
+            logger.warning(f"Cleanup after complete failed (non-fatal): {cleanup_err}")
         finally:
             pop_runtime_context(interview.id)
 
